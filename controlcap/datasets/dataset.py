@@ -21,6 +21,17 @@ class ControlCapDataset(BaseDataset):
         self.with_seg = kwargs.get("with_seg", False)
         self.obj_lvl = kwargs.get("obj_lvl", True)
         self.max_imgs = int(kwargs.get("max_imgs", int(1e7)))
+        
+        # NEW: allow env override for quick eval subsampling
+        import os as _os
+        _env_limit = _os.environ.get("EVAL_MAX_IMAGES", None)
+        if _env_limit is not None:
+            try:
+                self.max_imgs = min(self.max_imgs, int(_env_limit))
+                print(f"[INFO] Limiting dataset images to {self.max_imgs} via EVAL_MAX_IMAGES")
+            except ValueError:
+                pass
+
         self.max_objs = int(kwargs.get("max_objs", int(1e7)))
         self.ann_files = kwargs.get("annotations", None)
         tag_list = kwargs.get("tag_list", "controlcap/common/tagging/ram_tag_list.txt")
@@ -173,9 +184,15 @@ class ControlCapDataset(BaseDataset):
                 "caps": language_data["caps"],
                 "tags": language_data["tags"],
                 "ids": [obj["id"] for obj in objs]}
-        except:
-            print(f"find an invalid sample [{str(ann)}]")
-            return self.__getitem__(index + 1)
+        except Exception as e:
+            # NEW: Showing traceback
+            import traceback
+            # safer access if ann failed before assignment
+            ann_id = ann.get("id", "?") if 'ann' in locals() else '?'
+            img_file = ann.get("file_name", "?") if 'ann' in locals() else '?'
+            print(f"[ERROR] sample load failed idx={index} ann_id={ann_id} file={img_file}: {e}")
+            traceback.print_exc()
+            raise e
 
     def collater(self, samples):
         image_list = []

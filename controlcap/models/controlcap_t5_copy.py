@@ -1,11 +1,13 @@
-import math
 import copy
+import math
 import random
-import os
-import gc
-import torch.distributed as dist
-from contextlib import nullcontext
 from functools import partial
+from transformers import AutoModelForSeq2SeqLM, BitsAndBytesConfig
+import gc
+import os  # (ADDED) for env flag
+from contextlib import nullcontext  # (ADDED)
+import torch.distributed as dist
+
 
 import numpy as np
 import torch
@@ -55,66 +57,77 @@ class CrossAttnBlock(nn.Module):
 class ControlCapT5(Blip2T5):
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
-        # Optional memory logging (silent if not requested)
+        # (ADDED) flag: enable memory logging via kwarg or env var
         self.mem_log = kwargs.get("mem_log", False) or os.environ.get("RUN_MEM_LOG", "0") == "1"
-        base_kwargs = copy.deepcopy(kwargs)
-        base_kwargs_keys = ["vit_model", "img_size", "drop_path_rate", "use_grad_checkpoint", "vit_precision",
-                            "freeze_vit", "num_query_token", "t5_model", "prompt", "max_txt_len", "apply_lemmatizer"]
-        for key in kwargs.keys():
-            if key not in base_kwargs_keys:
-                base_kwargs.pop(key)
-        super().__init__(*args, **base_kwargs)
-        # AMP mode for Q-Former+T5: {"auto","bf16","fp16","fp32"}; auto=>bf16 if supported else fp32
+        # NEW: AMP mode for LLM path: one of {"auto","bf16","fp16","fp32"}
         self.llm_amp_mode = kwargs.get("llm_amp_mode", "auto")
-        # Optional micro-batch size for tag head; when not set, keep original behavior
-        self.tag_chunk_size = kwargs.get("tag_chunk_size", None)
-        self._tag_chunk_logged = False
-        # New: length-normalize sequence scores during eval (ranking stability)
-        self.length_normalize_scores = kwargs.get("length_normalize_scores", False)
+        load_in_8bit = kwargs.get("load_in_8bit", False)
+        load_in_4bit = kwargs.get("load_in_4bit", False)
+        device_map = kwargs.get("device_map", "auto")
+        hf_cache_dir = kwargs.get("hf_cache_dir", None)
+        # (ADDED) internal helper with CUDA + device safeguard
+        def _log_mem(tag):
+            if not self.mem_log or not torch.cuda.is_available():
+                return
+            dev = "cuda"
+            
+            alloc = torch.cuda.memory_allocated(dev) / 1024**3
+            reserv = torch.cuda.memory_reserved(dev) / 1024**3
+            peak = torch.cuda.max_memory_allocated(dev) / 1024**3
+            print(f"[MEM][{tag}] alloc={alloc:.2f}GB reserved={reserv:.2f}GB peak={peak:.2f}GB")
+        
+        self._log_mem = _log_mem
+        base_kwargs = copy.deepcopy(kwargs)
+        base_keys = ["vit_model","img_size","drop_path_rate","use_grad_checkpoint",
+                     "vit_precision","freeze_vit","num_query_token","t5_model",
+                     "prompt","max_txt_len","apply_lemmatizer"]
+        for k in list(base_kwargs.keys()):
+            if k not in base_keys:
+                base_kwargs.pop(k)
 
-        # Accept both naming styles for quantization flags
-        load_4_bit = kwargs.get("load_in_4bit", kwargs.get("load_4_bit", False))
-        load_8_bit = kwargs.get("load_in_8bit", kwargs.get("load_8_bit", False))
-        if load_4_bit and load_8_bit:
-            raise ValueError("Only one of load_4_bit or load_8_bit can be True.")
-        if load_4_bit or load_8_bit:
-            try:
-                from transformers import AutoModelForSeq2SeqLM, BitsAndBytesConfig
-            except ImportError as e:
-                raise ImportError("transformers with bitsandbytes support is required for quantization.") from e
-            model_id = base_kwargs.get("t5_model", None)
-            if model_id is None:
-                raise ValueError("t5_model must be specified to use quantized loading.")
-            # Avoid automatic multi-GPU sharding inside a single DDP rank to prevent cross-device embedding lookups
+        # Initialize BLIP2 (this builds vision encoder, Q-Former, and a full fp model.t5_model)
+        super().__init__(*args, **base_kwargs)
+        if self.mem_log and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        _log_mem("after_super_init")
+
+        # ===== Replace full-precision T5 with quantized variant if requested =====
+        if load_in_8bit or load_in_4bit:
+            # In DDP, avoid sharding across multiple GPUs inside a single process.
+            # Pin the T5 to the local rank device instead of device_map="auto".
             ddp_active = dist.is_available() and dist.is_initialized()
             if ddp_active:
                 local_rank = int(os.environ.get("LOCAL_RANK", "0"))
                 torch.cuda.set_device(local_rank)
-                device_map = {"": f"cuda:{local_rank}"}
-            else:
-                device_map = "auto"
+                if device_map in (None, "auto", "balanced", "balanced_low_0"):
+                    device_map = {"": f"cuda:{local_rank}"}
+                    if self.mem_log:
+                        print(f"[INFO] Overriding device_map for DDP. Using single-device map: {device_map}")
+            
+            model_id = base_kwargs["t5_model"]
             bnb_cfg = BitsAndBytesConfig(
-                load_in_4bit=load_4_bit,
-                load_in_8bit=load_8_bit,
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.float16,
             )
-            # Replace full-precision T5 with quantized version
             del self.t5_model
             gc.collect()
             torch.cuda.empty_cache()
+            _log_mem("after_delete_full_t5_before_quant_reload")
             self.t5_model = AutoModelForSeq2SeqLM.from_pretrained(
                 model_id,
                 quantization_config=bnb_cfg,
                 device_map=device_map,
+                cache_dir=hf_cache_dir,
             )
-            self._is_quantized = True
-            if self.mem_log:
-                print(f"[INFO] Loaded quantized T5 ({'4-bit' if load_4_bit else '8-bit'}) on {device_map}")
+            _log_mem("after_quant_t5_reload")
         else:
-            self._is_quantized = False
+            _log_mem("full_model_is_used_(no_quantization)")
 
+
+        # ===== Existing ControlCap custom modules (unchanged preamble) =====
         # contextual visual embedding module
         input_image_size = self.visual_encoder.image_size
         patch_size = self.visual_encoder.patch_embed.patch_size[0]
@@ -158,8 +171,8 @@ class ControlCapT5(Blip2T5):
         self.num_tags = len(self.tag_list)
         self.tag_labels = nn.Embedding(self.num_tags * 2, tag_bert_config.hidden_size)
         self.tag_fc = nn.Linear(tag_bert_config.hidden_size, 1)
-        self.tag_weight = 0.005
-        self.tag_loss_function = AsymmetricLoss(gamma_neg=7, gamma_pos=0, clip=0.05)
+        # NEW: micro-batch size for tag head (can override with env TAG_CHUNK_SIZE)
+        self.tag_chunk_size = int(kwargs.get("tag_chunk_size", int(os.environ.get("TAG_CHUNK_SIZE", 16))))
 
         # Trainable parameters
         names = ["cvem", "cem", "tag", "ebm", "Qformer", "t5_proj"]
@@ -169,14 +182,13 @@ class ControlCapT5(Blip2T5):
                 r=64, lora_alpha=128, lora_dropout=0.0,
                 target_modules=["embed_tokens", "lm_head", "q", "v"]
             )
-
             self.t5_model = get_peft_model(self.t5_model, lora_config)
-            # Only upcast if not quantized
-            if not self._is_quantized:
-                self.t5_model.to(torch.float32)
-            names.extend(["lora"])
-        params = [0] * len(names)
 
+        # Continue with original trainable param selection logic
+        names = ["cvem", "cem", "tag", "ebm", "Qformer", "t5_proj"]
+        if self.finetune_llm:
+            names.append("lora")
+        params = [0] * len(names)
         trainable_params = 0
         all_params = 0
         for param_name, param in self.named_parameters():
@@ -191,6 +203,7 @@ class ControlCapT5(Blip2T5):
         print(f"[ trainable ratio : {trainable_params / all_params}]")
         for idx, name in enumerate(names):
             print(f"[{name} ratio : {params[idx] / all_params}]")
+        _log_mem("after_param_freeze_selection")
 
     def roi_align(self, image_embeds, samples):
         # prepare cls image embeds and spatio image embeddings
@@ -224,35 +237,39 @@ class ControlCapT5(Blip2T5):
         return visual_embeds, visual_tag_embeds
 
     def tag_forward(self, samples, tag_embeds):
+        # BEFORE:
+        # bs = len(tag_embeds)
+        # object_atts = torch.ones(tag_embeds.size()[:-1], dtype=torch.long).to(
+        #     tag_embeds.device
+        # )
+        # label_embed = self.tag_labels.weight.unsqueeze(0).repeat(bs, 1, 1)
+        # tagging_embed = self.tag_head(
+        #     encoder_embeds=label_embed,
+        #     encoder_hidden_states=tag_embeds,
+        #     encoder_attention_mask=object_atts,
+        #     return_dict=False,
+        #     mode='tagging',
+        # )
+        # tag_logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
+        # return tag_logits
+
+        # NEW: micro-batch inference for tag head
         bs = tag_embeds.shape[0]
         device = tag_embeds.device
-        chunk = self.tag_chunk_size
-        # Use chunking only if explicitly set to a positive integer
-        use_chunk = isinstance(chunk, int) and chunk > 0 and chunk < bs
-        if use_chunk and not self._tag_chunk_logged:
-            print(f"[INFO] Using tag head chunking with chunk size = {chunk}")
-            self._tag_chunk_logged = True
-        if not use_chunk:
-            # Original behavior
-            object_atts = torch.ones(tag_embeds.size()[:-1], dtype=torch.long, device=device)
-            label_embed = self.tag_labels.weight.unsqueeze(0).repeat(bs, 1, 1)
-            tagging_embed = self.tag_head(
-                encoder_embeds=label_embed,
-                encoder_hidden_states=tag_embeds,
-                encoder_attention_mask=object_atts,
-                return_dict=False,
-                mode='tagging',
-            )
-            tag_logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
-            return tag_logits
-        # Chunked forward to cap peak VRAM
         object_atts_full = torch.ones(tag_embeds.size()[:-1], dtype=torch.long, device=device)
+
+        chunk = max(1, int(getattr(self, "tag_chunk_size", 16)))
+        if self.mem_log and torch.cuda.is_available():
+            print(f"[MEM] tag_forward: bs={bs} chunk={chunk} alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
         logits_chunks = []
         for st in range(0, bs, chunk):
             ed = min(st + chunk, bs)
             te = tag_embeds[st:ed]
             oa = object_atts_full[st:ed]
+            # repeat label embeddings only for the current micro-batch
             label_embed = self.tag_labels.weight.unsqueeze(0).expand(ed - st, -1, -1).to(device)
+
             tagging_embed = self.tag_head(
                 encoder_embeds=label_embed,
                 encoder_hidden_states=te,
@@ -262,101 +279,9 @@ class ControlCapT5(Blip2T5):
             )
             logits = self.tag_fc(tagging_embed[0]).squeeze(-1)
             logits_chunks.append(logits)
+
         tag_logits = torch.cat(logits_chunks, dim=0)
         return tag_logits
-
-    # Autocast context for Q-Former + T5, avoiding BF16 on unsupported GPUs
-    def _llm_autocast(self):
-        mode = getattr(self, "llm_amp_mode", "auto")
-        if mode == "auto":
-            mode = "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp32"
-        if mode == "bf16":
-            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
-        if mode == "fp16":
-            return torch.cuda.amp.autocast(dtype=torch.float16)
-        return nullcontext()
-    
-    def cem_forward(self, tags, embeds):
-        control_tokens = self.t5_tokenizer(
-            tags,
-            padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-            return_tensors="pt",
-        )
-        # Multi-GPU / possible device_map safety: use actual embedding weight device
-        emb_dev = self.t5_model.encoder.embed_tokens.weight.device
-        control_ids = control_tokens.input_ids.to(emb_dev)
-        control_embeds = self.t5_model.encoder.embed_tokens(control_ids)
-        control_embeds = control_embeds + self.cem_memory.to(emb_dev, dtype=control_embeds.dtype)
-        return control_embeds, control_tokens
-
-    def ebm_forward(self, v_embeds, c_embeds):
-        vl_embeds = self.ebm_v2l_mlp(v_embeds)
-        cl_embeds = self.ebm_c2l_mlp(c_embeds)
-        vl_embeds, _ = self.ebm_cl2vl_ca(vl_embeds, cl_embeds)
-        cl_embeds, _ = self.ebm_vl2cl_ca(cl_embeds, vl_embeds)
-        v_embeds = v_embeds + self.ebm_l2v_mlp(vl_embeds)
-        c_embeds = c_embeds + self.ebm_l2c_mlp(cl_embeds)
-        return v_embeds, c_embeds
-
-    def forward(self, samples):
-        image = torch.cat([samples["image"], samples["region_images"]], 0)
-
-        with self.maybe_autocast(dtype=torch.float16):
-            embeds = self.ln_vision(self.visual_encoder(image))
-            visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
-            tag_logits = self.tag_forward(samples, visual_tag_embeds)
-            control_words = self.prepare_control_words(samples, tag_logits)
-            control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
-            visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
-
-        with self._llm_autocast():
-            # Align dtype with Q-Former to avoid Half/Float matmul
-            q_dtype = next(self.Qformer.parameters()).dtype
-            visual_embeds = visual_embeds.to(dtype=q_dtype)
-            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
-            query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
-            query_output = self.Qformer.bert(
-                query_embeds=query_tokens,
-                encoder_hidden_states=visual_embeds,
-                encoder_attention_mask=object_atts,
-                return_dict=True,
-            )
-            inputs_t5 = self.t5_proj(query_output.last_hidden_state)
-            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
-            
-            # Realign devices/dtypes before concat
-            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
-            control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
-            encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
-            inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
-
-            tags = samples["tags"].to(torch.long)
-            loss_tag = self.tag_loss_function(tag_logits, tags) * self.tag_weight
-
-            output_tokens = self.t5_tokenizer(
-                samples["caps"],
-                padding="longest",
-                truncation=True,
-                max_length=self.max_txt_len,
-                return_tensors="pt",
-            ).to(inputs_embeds.device)
-
-            targets = output_tokens.input_ids.masked_fill(output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100)
-
-            outputs = self.t5_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=encoder_atts,
-                decoder_attention_mask=output_tokens.attention_mask,
-                return_dict=True,
-                labels=targets,
-            )
-            loss_llm = outputs.loss
-
-            return {"loss": loss_llm + loss_tag, "loss_llm": loss_llm.detach(), "loss_tag": loss_tag.detach()}
 
     def prepare_control_words(self, samples, tag_logits):
         control_words = []
@@ -452,29 +377,61 @@ class ControlCapT5(Blip2T5):
 
             return control_words, stags, otags
 
-    def predict_answers(
-            self,
-            samples,
-            *args,
-            **kwargs,
-    ):
+    def cem_forward(self, tags, embeds):
+        control_tokens = self.t5_tokenizer(
+            tags,
+            padding="longest",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        )
+        # Compute embeddings on the same device as the sharded embedding table (works with device_map="auto")
+        emb_dev = self.t5_model.encoder.embed_tokens.weight.device
+        control_embeds = self.t5_model.encoder.embed_tokens(control_tokens.input_ids.to(emb_dev))
+        control_embeds = control_embeds + self.cem_memory.to(emb_dev, dtype=control_embeds.dtype)
+        return control_embeds, control_tokens
+    
+    def ebm_forward(self, v_embeds, c_embeds):
+        vl_embeds = self.ebm_v2l_mlp(v_embeds)
+        cl_embeds = self.ebm_c2l_mlp(c_embeds)
+        vl_embeds, _ = self.ebm_cl2vl_ca(vl_embeds, cl_embeds)
+        cl_embeds, _ = self.ebm_vl2cl_ca(cl_embeds, vl_embeds)
+        v_embeds = v_embeds + self.ebm_l2v_mlp(vl_embeds)
+        c_embeds = c_embeds + self.ebm_l2c_mlp(cl_embeds)
+        return v_embeds, c_embeds
+
+    def forward(self, samples):
+        if self.mem_log and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            print("[MEM] forward:start")
         image = torch.cat([samples["image"], samples["region_images"]], 0)
 
         with self.maybe_autocast(dtype=torch.float16):
+            # vision + CVEM + tagger
             embeds = self.ln_vision(self.visual_encoder(image))
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] forward:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] forward:after_cvem alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
-            control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] forward:after_tag_forward alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            control_words = self.prepare_control_words(samples, tag_logits)
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] forward:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
+        # LLM path (Q-Former + T5): avoid bf16 on unsupported GPUs, prefer fp32 for stability
         with self._llm_autocast():
-            # Align dtype with Q-Former to avoid Half/Float matmul
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] forward:before_t5 alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+           # Align encoder_hidden_states dtype with Q-Former weights to avoid Half/Float matmul
             q_dtype = next(self.Qformer.parameters()).dtype
             visual_embeds = visual_embeds.to(dtype=q_dtype)
-            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
+
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
             query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
             query_output = self.Qformer.bert(
                 query_embeds=query_tokens,
@@ -484,11 +441,111 @@ class ControlCapT5(Blip2T5):
             )
             inputs_t5 = self.t5_proj(query_output.last_hidden_state)
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
-            # Realign devices/dtypes before concat
-            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
+            # Align devices/dtypes before concat when model is sharded across GPUs
             control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
+            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
             encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
+            # If running fp32 LLM mode on GPUs without bf16, keep embeds in fp32 to prevent NaNs
+            if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
+                inputs_embeds = inputs_embeds.float()
+            
+            tags = samples["tags"].to(torch.long)
+            loss_tag = self.tag_loss_function(tag_logits, tags) * self.tag_weight
+
+            output_tokens = self.t5_tokenizer(
+                samples["caps"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_txt_len,
+                return_tensors="pt",
+            ).to(inputs_embeds.device)
+
+            targets = output_tokens.input_ids.masked_fill(
+                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100
+            )
+
+            outputs = self.t5_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=encoder_atts,
+                decoder_attention_mask=output_tokens.attention_mask,
+                return_dict=True,
+                labels=targets,
+            )
+            if self.mem_log and torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated()/1024**3
+                print(f"[MEM] forward:end peak={peak:.2f}GB")
+            loss_llm = outputs.loss
+
+            return {"loss": loss_llm + loss_tag, "loss_llm": loss_llm.detach(), "loss_tag": loss_tag.detach()}
+
+    def _llm_autocast(self):
+        mode = getattr(self, "llm_amp_mode", "auto")
+        # On P100, bf16 is not supported; auto => fp32
+        if mode == "auto":
+            mode = "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp32"
+        if mode == "bf16":
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        if mode == "fp16":
+            return torch.cuda.amp.autocast(dtype=torch.float16)
+        # fp32 or unknown -> no autocast
+        return nullcontext()
+
+    def predict_answers(
+            self,
+            samples,
+            *args,
+            **kwargs,
+    ):
+        if self.mem_log and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            print("[MEM] predict:start")
+        image = torch.cat([samples["image"], samples["region_images"]], 0)
+
+        with self.maybe_autocast(dtype=torch.float16):
+            # vision + CVEM + tagger
+            embeds = self.ln_vision(self.visual_encoder(image))
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:after_vision alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:after_cvem alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            tag_logits = self.tag_forward(samples, visual_tag_embeds)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:after_tag_forward alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
+            control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
+            visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:after_ebm alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+
+        with self._llm_autocast():
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:before_qformer alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+           # Align encoder_hidden_states dtype with Q-Former weights
+            q_dtype = next(self.Qformer.parameters()).dtype
+            visual_embeds = visual_embeds.to(dtype=q_dtype)
+
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=visual_embeds,
+                encoder_attention_mask=object_atts,
+                return_dict=True,
+            )
+            inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+            # Align devices/dtypes before concat when model is sharded across GPUs
+            control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
+            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
+            encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
+            inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
+            if (getattr(self, "llm_amp_mode", "auto") in ("fp32", "auto")) and (not torch.cuda.is_bf16_supported()):
+                inputs_embeds = inputs_embeds.float()
+
+            if self.mem_log and torch.cuda.is_available():
+                print(f"[MEM] predict:before_generate alloc={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
             llm_kwargs = {
                 "do_sample": False,
@@ -509,8 +566,11 @@ class ControlCapT5(Blip2T5):
                 attention_mask=encoder_atts,
                 output_scores=True,
                 return_dict_in_generate=True,
-                **llm_kwargs
+                **llm_kwargs,
             )
+            if self.mem_log and torch.cuda.is_available():
+                peak = torch.cuda.max_memory_allocated()/1024**3
+                print(f"[MEM] predict:end peak={peak:.2f}GB")
 
             sequences = outputs["sequences"]
             scores = outputs["sequences_scores"]
@@ -533,9 +593,7 @@ class ControlCapT5(Blip2T5):
 
         return output
 
+
     @classmethod
     def from_config(cls, cfg):
-        model = cls(**cfg)
-        if cfg.pretrained is not None:
-            model.load_checkpoint(url_or_filename=cfg.pretrained)
-        return model
+        return cls(**cfg)

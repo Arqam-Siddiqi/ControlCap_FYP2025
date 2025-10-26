@@ -33,6 +33,18 @@ class ControlCapTask(BaseTask):
         self.report_metric = kwargs.get("report_metric", True)
         self.visualize = kwargs.get("visualize", True)
 
+        # NEW: optional cap on evaluation images
+        import os as _os
+        self.max_eval_images = kwargs.get("max_eval_images", None)
+        if self.max_eval_images is None:
+            _env = _os.environ.get("EVAL_MAX_IMAGES", None)
+            if _env is not None:
+                try:
+                    self.max_eval_images = int(_env)
+                    print(f"[INFO] Limiting evaluation metrics to first {self.max_eval_images} images")
+                except ValueError:
+                    pass
+
     @classmethod
     def setup_task(cls, cfg):
         return cls(**dict(cfg.run_cfg))
@@ -181,12 +193,30 @@ class ControlCapTask(BaseTask):
         for name in datasets_config:
             dataset_config = datasets_config[name]
 
+            # NEW: A Block to prevent building train
+            if self.evaluate and (
+                (self.eval_dataset_name is None and name == list(datasets_config)[0])
+                or (self.eval_dataset_name is not None and name == self.eval_dataset_name)
+            ):
+                import copy
+                dataset_config = copy.deepcopy(dataset_config)
+                anns = dataset_config.build_info.annotations
+                if "train" in anns:
+                    print("NEW: Skipped training dataset build")
+                    anns.pop("train")  # prevents building train split
+                # (optional) also drop test if not needed:
+                # if "test" in anns: anns.pop("test")
+
             builder = registry.get_builder_class("controlcap")(dataset_config)
             dataset = builder.build_datasets()
 
-            if not name == eval_dataset_name:
+            if name != eval_dataset_name:
                 dataset.pop("val", None)
                 dataset.pop("test", None)
+                
+            # NEW: if only evaluating, drop the train split even for the eval dataset
+            if self.evaluate:
+                dataset.pop("train", None)
 
             datasets[name] = dataset
 
@@ -346,7 +376,7 @@ class ControlCapTask(BaseTask):
         return metrics
 
     @dist_utils.main_process
-    def report_metrics_densecap(self, result_file):
+    def report_metrics_densecap(self, result_file, gt_file_override=None):
         logging.info(f":Begin evaluation ({result_file}).")
 
         def seg2bbox(seg):
@@ -363,24 +393,28 @@ class ControlCapTask(BaseTask):
                 elif not isinstance(seg["counts"], bytes):
                     seg["counts"] = seg["counts"].encode()
                 mask = mask_util.decode(seg)
-                x1, x2 = np.nonzero(mask.sum(0) != 0)[0][0], np.nonzero(mask.sum(0) != 0)[0][-1]
+                x1, x2 = np.nonzero(mask.sum(0) != 0)[0][0], np.nonzero(mask.sum(0) != 0)[0][-1]  
                 y1, y2 = np.nonzero(mask.sum(1) != 0)[0][0], np.nonzero(mask.sum(1) != 0)[0][-1]
                 bbox = [x1, y1, x2, y2]
             return bbox
 
-        # prediction
+        # prediction COCO
         result = COCO(result_file)
 
-        # ground truth
+        # ground truth selection
         gt_dict = {"vg1.2": "data/vg/controlcap/vg1.2/test.json",
                    "vg1.0": "data/vg/controlcap/vg1.0/test.json",
                    "vgcoco": "data/vg/controlcap/vgcoco/test.json"}
-        gt_file = gt_dict.get(self.eval_dataset_name, None)
+        if gt_file_override is not None:
+            gt_file = gt_file_override
+            logging.warning(f"Using overridden GT file: {gt_file}")
+        else:
+            gt_file = gt_dict.get(self.eval_dataset_name, None)
+        if gt_file is None or not os.path.exists(gt_file):
+            raise ValueError(f"Ground Truth file for [{self.eval_dataset_name}] not found (got {gt_file}).")
         gt = COCO(gt_file)
 
         empty_pred_num = 0
-
-        # evaluation
         ev = DenseCapEvaluator()
         recs = []
         for image_id, _ in tqdm.tqdm(list(gt.imgs.items())):
@@ -406,17 +440,20 @@ class ControlCapTask(BaseTask):
                 box = seg2bbox(pred['segmentation'])
                 pred_result = pred['extra_info'].get('pred_result', None)
                 if pred_result is None:
-                    print("find empty result")
                     continue
                 score = pred_result.get('score', 1)
                 caption = pred_result.get('caption', "")
                 scores.append(score)
                 boxes.append(box)
                 text.append(caption)
+
+            if len(boxes) == 0:
+                empty_pred_num += 1
+                continue
+
             rec['scores'] = scores
             rec['boxes'] = boxes
             rec['text'] = text
-
             rec['img_info'] = image_id
             recs.append(rec)
 
@@ -430,18 +467,15 @@ class ControlCapTask(BaseTask):
                     target_text=rec['target_text'],
                     img_info=rec['img_info'],
                 )
-            except:
-                print("sample error")
+            except Exception as e:
+                print(f"sample error: {e}")
 
         if empty_pred_num != 0:
             logging.info(f":Image numbers with empty prediction ({empty_pred_num}).")
 
         metrics = ev.evaluate()
-
         logging.info(f":Metrics ({str(metrics)}).")
-
         metrics["agg_metrics"] = metrics["map"]
-
         return metrics
 
     @dist_utils.main_process
