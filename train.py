@@ -41,11 +41,10 @@ def parse_args():
         "in xxx=yyy format will be merged into config file (deprecate), "
         "change to --cfg-options instead.",
     )
+    parser.add_argument("--inference-gt-path", default=None,
+                        help="(Optional) alternate COCO-style JSON used ONLY for building inference samples (bboxes/segmentations). Metrics still use original GT.")
 
     args = parser.parse_args()
-    # if 'LOCAL_RANK' not in os.environ:
-    #     os.environ['LOCAL_RANK'] = str(args.local_rank)
-
     return args
 
 def setup_seeds(config):
@@ -85,6 +84,29 @@ def main():
     cfg.pretty_print()
 
     task = tasks.setup_task(cfg)
+
+    # If an inference GT override is provided, attach it to task and patch the dataset config
+    # so that the builder will create eval datasets from the alternate ann file (used only for inference samples).
+    inf_gt = getattr(cfg.args, "inference_gt_path", None)
+    if inf_gt is not None:
+        # attach for downstream visibility
+        task.inference_gt_path = inf_gt
+        try:
+            import copy, logging
+            # determine eval dataset name (task may have been constructed with eval_dataset_name)
+            eval_name = task.eval_dataset_name or list(cfg.datasets_cfg)[0]
+            # deep copy target dataset cfg before mutating
+            ds_cfg = copy.deepcopy(getattr(cfg.datasets_cfg, eval_name))
+            if hasattr(ds_cfg.build_info, "annotations") and hasattr(ds_cfg.build_info.annotations, "val"):
+                ds_cfg.build_info.annotations.val = [inf_gt]
+                setattr(cfg.datasets_cfg, eval_name, ds_cfg)
+                logging.info(f"Overrode eval annotations for dataset [{eval_name}] with {inf_gt} for inference samples.")
+            else:
+                logging.warning(f"Could not locate build_info.annotations.val for dataset [{eval_name}] to override inference GT.")
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to apply inference GT override ({inf_gt}): {e}")
+    
     datasets = task.build_datasets(cfg)
     model = task.build_model(cfg)
 

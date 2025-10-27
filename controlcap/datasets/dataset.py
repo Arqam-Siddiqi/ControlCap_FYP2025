@@ -8,6 +8,7 @@ from PIL import Image
 import pycocotools.mask as mask_util
 from pycocotools.coco import COCO
 import matplotlib.pyplot as plt
+import json
 
 from lavis.datasets.datasets.base_dataset import BaseDataset
 
@@ -149,11 +150,24 @@ class ControlCapDataset(BaseDataset):
         return data
 
     def get_language_data(self, ann, objs):
+        # Coerce caption objects to strings to avoid worker crashes when
+        # processors expect a string. This preserves existing behavior for
+        # normal string captions and provides a readable fallback for dicts/lists.
+        def _coerce_cap(c):
+            if isinstance(c, str):
+                return c
+            if isinstance(c, dict) and "caption" in c and isinstance(c["caption"], str):
+                return c["caption"]
+            try:
+                return json.dumps(c)
+            except Exception:
+                return str(c)
+
         if self.split == "train":
-            caps = [obj["caption"] for obj in objs]
+            caps = [_coerce_cap(obj.get("caption")) for obj in objs]
             tags = torch.zeros([len(objs), self.num_tags * 2])
             for i, obj in enumerate(objs):
-                extra_info = obj["extra_info"]
+                extra_info = obj.get("extra_info", {})
                 if "tag_set1" in extra_info.get("parser_result", dict()):
                     tag_set1 = extra_info["parser_result"].get("tag_set1", [])
                     for j in tag_set1:
@@ -163,11 +177,11 @@ class ControlCapDataset(BaseDataset):
                     for j in tag_set2:
                         tags[i, j + self.num_tags] = 1
         else:
-            caps = [obj["caption"] for obj in objs]
+            caps = [_coerce_cap(obj.get("caption")) for obj in objs]
             tags = torch.zeros([len(objs), self.num_tags * 2])
 
         caps = [self.text_processor(cap) for cap in caps]
-
+ 
         return {"caps": caps, "tags": tags.to(torch.long)}
 
     def __getitem__(self, index):
