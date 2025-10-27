@@ -15,6 +15,12 @@ from textblob import TextBlob
 from torchvision.models.vision_transformer import MLPBlock
 from peft import LoraConfig, get_peft_model
 
+# ADDED: try optional BERTopic import (soft dependency)
+try:
+    from bertopic import BERTopic
+except Exception:
+    BERTopic = None
+
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2_t5 import Blip2T5
 from controlcap.models.tagging_heads.bert import BertConfig, BertModel
@@ -465,6 +471,44 @@ class ControlCapT5(Blip2T5):
             visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
+
+            # ADDED: generate image-level captions (one caption per input image) and extract topics,
+            # then append top topics to each region's control word corresponding to that image.
+            # Map region -> image index via samples["batch_idx"] if available.
+            try:
+                # get original images tensor (before concatenation)
+                image_only = samples.get("image", None)
+                if image_only is not None:
+                    image_only = image_only.to(next(self.visual_encoder.parameters()).device)
+                    img_captions = self.generate_image_caption(image_only)
+                    img_topics = self.extract_topics_from_captions(img_captions, top_k=3)
+                    # append topics to per-region control_words
+                    batch_idx = samples.get("batch_idx", None)
+                    if batch_idx is None:
+                        # If not available, append global topics (first image) to all control words
+                        global_topics = ",".join(img_topics[0]) if len(img_topics) > 0 else ""
+                        new_cw = []
+                        for cw in control_words:
+                            base = cw.rstrip("|")
+                            if global_topics:
+                                base = base + ("," + global_topics if base else global_topics)
+                            new_cw.append(base + "|")
+                        control_words = new_cw
+                    else:
+                        # batch_idx expected as tensor mapping region->image index
+                        new_cw = []
+                        for i, cw in enumerate(control_words):
+                            img_idx = int(batch_idx[i].item()) if i < len(batch_idx) else 0
+                            topics_for_img = ",".join(img_topics[img_idx]) if img_idx < len(img_topics) else ""
+                            base = cw.rstrip("|")
+                            if topics_for_img:
+                                base = base + ("," + topics_for_img if base else topics_for_img)
+                            new_cw.append(base + "|")
+                        control_words = new_cw
+            except Exception:
+                # If any failure, continue with original control_words
+                pass
+
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
 
@@ -539,3 +583,75 @@ class ControlCapT5(Blip2T5):
         if cfg.pretrained is not None:
             model.load_checkpoint(url_or_filename=cfg.pretrained)
         return model
+    
+    def generate_image_caption(self, image_tensor, num_beams=3, max_new_tokens=20):
+        if image_tensor is None or image_tensor.shape[0] == 0:
+            return []
+        # run vision path (use same vision + Q-Former + t5 projection as in predict)
+        with self.maybe_autocast(dtype=torch.float16):
+            embeds = self.ln_vision(self.visual_encoder(image_tensor))
+        # LLM path (Q-Former + T5). Use _llm_autocast for dtype-safe generation.
+        with self._llm_autocast():
+            q_dtype = next(self.Qformer.parameters()).dtype
+            visual_embeds = embeds.to(dtype=q_dtype)
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image_tensor.device)
+            query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=visual_embeds,
+                encoder_attention_mask=object_atts,
+                return_dict=True,
+            )
+            inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(inputs_t5.device)
+
+            # Ensure inputs on the correct device for (possibly sharded) t5_model
+            inputs_t5 = inputs_t5.to(next(self.t5_model.parameters()).device)
+
+            gen_kwargs = {"num_beams": num_beams, "max_new_tokens": max_new_tokens, "do_sample": False}
+            outputs = self.t5_model.generate(
+                inputs_embeds=inputs_t5,
+                attention_mask=atts_t5.to(inputs_t5.device),
+                **gen_kwargs,
+            )
+            # decode
+            captions = self.t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        return captions
+
+    # ADDED: extract topics using BERTopic if available, else fall back to TextBlob noun/adjective extraction
+    def extract_topics_from_captions(self, captions, top_k=3):
+        if len(captions) == 0:
+            return [[] for _ in captions]
+        if BERTopic is not None:
+            try:
+                topic_model = BERTopic(verbose=False)
+                topics, probs = topic_model.fit_transform(captions)
+                topic_terms_per_doc = []
+                for i, t in enumerate(topics):
+                    if t == -1:
+                        topic_terms_per_doc.append([])
+                        continue
+                    terms = [term for term, _ in topic_model.get_topic(t)][:top_k]
+                    topic_terms_per_doc.append(terms)
+                return topic_terms_per_doc
+            except Exception:
+                # fallback to simple extractor below
+                pass
+        # Fallback: use TextBlob to extract nouns/adjectives and return most frequent top_k terms
+        topic_terms_per_doc = []
+        for cap in captions:
+            try:
+                tags = TextBlob(cap).tags
+                candidates = [word for word, pos in tags if ("NN" in pos) or ("JJ" in pos)]
+                # keep order and unique
+                seen = set()
+                filtered = []
+                for w in candidates:
+                    lw = w.lower()
+                    if lw not in seen:
+                        seen.add(lw)
+                        filtered.append(lw)
+                topic_terms_per_doc.append(filtered[:top_k])
+            except Exception:
+                topic_terms_per_doc.append([])
+        return topic_terms_per_doc
