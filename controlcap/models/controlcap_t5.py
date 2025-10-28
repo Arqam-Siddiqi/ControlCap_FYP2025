@@ -72,6 +72,8 @@ class ControlCapT5(Blip2T5):
         super().__init__(*args, **base_kwargs)
         # AMP mode for Q-Former+T5: {"auto","bf16","fp16","fp32"}; auto=>bf16 if supported else fp32
         self.llm_amp_mode = kwargs.get("llm_amp_mode", "auto")
+        # topical flag: when False skip BLIP2+BERTopic topical pipeline during evaluation
+        self.topical = kwargs.get("topical", False)
         # Optional micro-batch size for tag head; when not set, keep original behavior
         self.tag_chunk_size = kwargs.get("tag_chunk_size", None)
         self._tag_chunk_logged = False
@@ -472,42 +474,41 @@ class ControlCapT5(Blip2T5):
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
 
-            # ADDED: generate image-level captions (one caption per input image) and extract topics,
-            # then append top topics to each region's control word corresponding to that image.
-            # Map region -> image index via samples["batch_idx"] if available.
-            try:
-                # get original images tensor (before concatenation)
-                image_only = samples.get("image", None)
-                if image_only is not None:
-                    image_only = image_only.to(next(self.visual_encoder.parameters()).device)
-                    img_captions = self.generate_image_caption(image_only)
-                    img_topics = self.extract_topics_from_captions(img_captions, top_k=3)
-                    # append topics to per-region control_words
-                    batch_idx = samples.get("batch_idx", None)
-                    if batch_idx is None:
-                        # If not available, append global topics (first image) to all control words
-                        global_topics = ",".join(img_topics[0]) if len(img_topics) > 0 else ""
-                        new_cw = []
-                        for cw in control_words:
-                            base = cw.rstrip("|")
-                            if global_topics:
-                                base = base + ("," + global_topics if base else global_topics)
-                            new_cw.append(base + "|")
-                        control_words = new_cw
-                    else:
-                        # batch_idx expected as tensor mapping region->image index
-                        new_cw = []
-                        for i, cw in enumerate(control_words):
-                            img_idx = int(batch_idx[i].item()) if i < len(batch_idx) else 0
-                            topics_for_img = ",".join(img_topics[img_idx]) if img_idx < len(img_topics) else ""
-                            base = cw.rstrip("|")
-                            if topics_for_img:
-                                base = base + ("," + topics_for_img if base else topics_for_img)
-                            new_cw.append(base + "|")
-                        control_words = new_cw
-            except Exception:
-                # If any failure, continue with original control_words
-                pass
+            # Optionally run topical model (BLIP2 captioning + BERTopic). Controlled by self.topical.
+            if getattr(self, "topical", True):
+                try:
+                    # get original images tensor (before concatenation)
+                    image_only = samples.get("image", None)
+                    if image_only is not None:
+                        image_only = image_only.to(next(self.visual_encoder.parameters()).device)
+                        img_captions = self.generate_image_caption(image_only)
+                        img_topics = self.extract_topics_from_captions(img_captions, top_k=3)
+                        # append topics to per-region control_words
+                        batch_idx = samples.get("batch_idx", None)
+                        if batch_idx is None:
+                            # If not available, append global topics (first image) to all control words
+                            global_topics = ",".join(img_topics[0]) if len(img_topics) > 0 else ""
+                            new_cw = []
+                            for cw in control_words:
+                                base = cw.rstrip("|")
+                                if global_topics:
+                                    base = base + ("," + global_topics if base else global_topics)
+                                new_cw.append(base + "|")
+                            control_words = new_cw
+                        else:
+                            # batch_idx expected as tensor mapping region->image index
+                            new_cw = []
+                            for i, cw in enumerate(control_words):
+                                img_idx = int(batch_idx[i].item()) if i < len(batch_idx) else 0
+                                topics_for_img = ",".join(img_topics[img_idx]) if img_idx < len(img_topics) else ""
+                                base = cw.rstrip("|")
+                                if topics_for_img:
+                                    base = base + ("," + topics_for_img if base else topics_for_img)
+                                new_cw.append(base + "|")
+                            control_words = new_cw
+                except Exception:
+                    # If any failure, continue with original control_words
+                    pass
 
             control_embeds, control_tokens = self.cem_forward(control_words, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
@@ -623,6 +624,7 @@ class ControlCapT5(Blip2T5):
         if len(captions) == 0:
             return [[] for _ in captions]
         if BERTopic is not None:
+            print("Extracting topics with Topic Modeling")
             try:
                 topic_model = BERTopic(verbose=False)
                 topics, probs = topic_model.fit_transform(captions)
@@ -633,6 +635,7 @@ class ControlCapT5(Blip2T5):
                         continue
                     terms = [term for term, _ in topic_model.get_topic(t)][:top_k]
                     topic_terms_per_doc.append(terms)
+                print(f"Topics: {topic_terms_per_doc}")
                 return topic_terms_per_doc
             except Exception:
                 # fallback to simple extractor below
@@ -640,6 +643,7 @@ class ControlCapT5(Blip2T5):
         # Fallback: use TextBlob to extract nouns/adjectives and return most frequent top_k terms
         topic_terms_per_doc = []
         for cap in captions:
+            print("ERROR: Falling back to TextBlob")
             try:
                 tags = TextBlob(cap).tags
                 candidates = [word for word, pos in tags if ("NN" in pos) or ("JJ" in pos)]
