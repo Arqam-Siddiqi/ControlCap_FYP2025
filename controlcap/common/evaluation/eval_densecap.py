@@ -95,7 +95,7 @@ class DenseCapEvaluator(object):
 
         return meteor, meteor_scores
 
-    def add_result(self, scores, boxes, text, target_boxes, target_text, img_info=None):
+    def add_result(self, scores, boxes, text, target_boxes, target_text, img_info=None, ann_ids=None):
         """
 
         :param scores: (B,) tensor
@@ -104,6 +104,7 @@ class DenseCapEvaluator(object):
         :param target_boxes: (M x 4) tensor: x1y1x2y2
         :param target_text: length M list of strings
         :param img_info: string info of input
+        :param ann_ids: optional tensor/list of annotation ids corresponding to each detection
         :return:
         """
 
@@ -117,6 +118,15 @@ class DenseCapEvaluator(object):
         boxes = boxes.cpu().double()
         scores = scores.view(-1).cpu()
         target_boxes = target_boxes.cpu().double()
+
+        if ann_ids is not None:
+            # ann_ids can be tensor or list-like; normalize to python list
+            try:
+                ann_ids_list = ann_ids.view(-1).cpu().tolist()
+            except:
+                ann_ids_list = list(ann_ids)
+        else:
+            ann_ids_list = None
 
         # merge ground truth boxes that overlap by >= 0.7
         merged_ix = merge_boxes(target_boxes, 0.7)
@@ -150,7 +160,9 @@ class DenseCapEvaluator(object):
                 'iou': largest_iou.item(),
                 'candidate': text[cand_idx],
                 'references': merged_text[gt_idx] if largest_iou.item() > 0 else [],
-                'img_info': img_info
+                'img_info': img_info,
+                'score': sorted_scores[d].item(),
+                'ann_id': (ann_ids_list[cand_idx] if ann_ids_list is not None else None)
             }
 
             self.records.append(record)

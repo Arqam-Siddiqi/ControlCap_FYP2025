@@ -376,7 +376,7 @@ class ControlCapTask(BaseTask):
         return metrics
 
     @dist_utils.main_process
-    def report_metrics_densecap(self, result_file, gt_file_override=None):
+    def report_metrics_densecap(self, result_file, gt_file_override=None, dump_meteor_caption_path=None, dump_meteor_image_path=None):
         logging.info(f":Begin evaluation ({result_file}).")
 
         def seg2bbox(seg):
@@ -436,6 +436,7 @@ class ControlCapTask(BaseTask):
             scores = []
             boxes = []
             text = []
+            ann_ids = []
             for pred in preds:
                 box = seg2bbox(pred['segmentation'])
                 pred_result = pred['extra_info'].get('pred_result', None)
@@ -446,6 +447,7 @@ class ControlCapTask(BaseTask):
                 scores.append(score)
                 boxes.append(box)
                 text.append(caption)
+                ann_ids.append(pred.get('id', None))
 
             if len(boxes) == 0:
                 empty_pred_num += 1
@@ -455,7 +457,24 @@ class ControlCapTask(BaseTask):
             rec['boxes'] = boxes
             rec['text'] = text
             rec['img_info'] = image_id
+            rec['ann_ids'] = ann_ids
             recs.append(rec)
+
+        # --- NEW: build ann_id -> (bbox, model_score, image_id) map for dumps ---
+        ann_map = {}
+        for rec in recs:
+            img_id = rec.get('img_info')
+            scores = rec.get('scores', [])
+            boxes = rec.get('boxes', [])
+            ann_ids = rec.get('ann_ids', [])
+            for i, aid in enumerate(ann_ids):
+                if aid is None:
+                    continue
+                # normalize bbox to list of ints/floats
+                bbox = boxes[i] if i < len(boxes) else None
+                score = float(scores[i]) if i < len(scores) else None
+                ann_map[aid] = {"bbox": bbox, "model_score": score, "image_id": img_id}
+        # --- END NEW ---
 
         for rec in tqdm.tqdm(recs):
             try:
@@ -466,6 +485,7 @@ class ControlCapTask(BaseTask):
                     target_boxes=torch.tensor(rec['target_boxes']),
                     target_text=rec['target_text'],
                     img_info=rec['img_info'],
+                    ann_ids=torch.tensor(rec['ann_ids']) if len(rec['ann_ids'])>0 else None,
                 )
             except Exception as e:
                 print(f"sample error: {e}")
@@ -476,6 +496,70 @@ class ControlCapTask(BaseTask):
         metrics = ev.evaluate()
         logging.info(f":Metrics ({str(metrics)}).")
         metrics["agg_metrics"] = metrics["map"]
+
+        # Dump METEOR-based per-caption and per-image scores if requested
+        try:
+            if (dump_meteor_caption_path or dump_meteor_image_path) and hasattr(ev, 'meteors'):
+                meteors = ev.meteors  # list aligned with ev.records
+                per_caption = []
+                per_image_map = {}
+                per_image_model_map = {}
+                for idx, record in enumerate(ev.records):
+                    ann_id = record.get('ann_id', None)
+                    image_id = record.get('img_info', None)
+                    # predicted caption (candidate) and ground-truth references (list)
+                    pred_caption = record.get('candidate', "")
+                    gt_captions = record.get('references', []) if record.get('references', None) is not None else []
+                    meteor_score = float(meteors[idx]) if meteors and idx < len(meteors) else 0.0
+
+                    # Lookup bbox and model_score via ann_id if available, else fall back to record fields
+                    if ann_id is not None and ann_id in ann_map:
+                        pred_bbox = ann_map[ann_id]["bbox"]
+                        model_score = ann_map[ann_id]["model_score"]
+                    else:
+                        # ev.records contains 'score' (sorted detection confidence) — use it when ann_id missing
+                        pred_bbox = None
+                        model_score = float(record.get('score', 0.0))
+
+                    per_caption.append({
+                        "ann_id": ann_id,
+                        "image_id": image_id,
+                        "meteor": meteor_score,
+                        "model_score": model_score,
+                        "pred_bbox": pred_bbox,
+                        "pred_caption": pred_caption,
+                        "gt_captions": gt_captions
+                    })
+                    per_image_map.setdefault(image_id, []).append(meteor_score)
+                    per_image_model_map.setdefault(image_id, []).append(model_score)
+
+                if dump_meteor_caption_path:
+                    out_path = dump_meteor_caption_path
+                    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+                    per_caption_sorted = sorted(per_caption, key=lambda x: x["meteor"])
+                    with open(out_path, "w") as fw:
+                        json.dump(per_caption_sorted, fw, ensure_ascii=False, indent=2)
+
+                if dump_meteor_image_path:
+                    out_path = dump_meteor_image_path
+                    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+                    per_image = []
+                    for img_id, scores in per_image_map.items():
+                        avg_meteor = sum(scores) / len(scores) if len(scores) > 0 else 0.0
+                        model_scores = per_image_model_map.get(img_id, [])
+                        avg_model = sum(model_scores) / len(model_scores) if len(model_scores) > 0 else 0.0
+                        per_image.append({
+                            "image_id": img_id,
+                            "avg_meteor": avg_meteor,
+                            "avg_model_score": avg_model,
+                            "num_preds": len(scores)
+                        })
+                    per_image_sorted = sorted(per_image, key=lambda x: x["avg_meteor"])
+                    with open(out_path, "w") as fw:
+                        json.dump(per_image_sorted, fw, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.warning(f"Could not dump METEOR scores: {e}")
+
         return metrics
 
     @dist_utils.main_process

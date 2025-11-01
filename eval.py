@@ -3,6 +3,7 @@
 import argparse
 import os.path
 import random
+import json
 
 import numpy as np
 import torch
@@ -28,6 +29,8 @@ def parse_args():
     parser.add_argument("--gt-path", default=None, help="(Optional) custom ground-truth JSON for subset evaluation")
     parser.add_argument("--metric", action="store_true", help="evaluate meteor score")
     parser.add_argument("--visualize", action="store_true", help="visualize result")
+    parser.add_argument("--save-caption-scores", default=None, help="(Optional) path to save per-caption scores (json), ascending by score")
+    parser.add_argument("--save-image-scores", default=None, help="(Optional) path to save per-image scores (json), ascending by score (avg of caption scores)")
     parser.add_argument("--local-rank", default=-1, type=int)
     parser.add_argument(
         "--options",
@@ -67,8 +70,12 @@ def main():
         if ("reg" in task.eval_dataset_name) or ("refcoco" in task.eval_dataset_name):
             task.report_metrics_reg(res_path)
         else:
-            # pass override gt path (new argument)
-            task.report_metrics_densecap(res_path, gt_file_override=cfg.args.gt_path)
+            task.report_metrics_densecap(
+                res_path,
+                gt_file_override=cfg.args.gt_path,
+                dump_meteor_caption_path=cfg.args.save_caption_scores,
+                dump_meteor_image_path=cfg.args.save_image_scores,
+            )
 
     if cfg.args.visualize:
         task.visualize_result(res_path)
