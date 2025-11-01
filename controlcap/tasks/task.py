@@ -504,6 +504,30 @@ class ControlCapTask(BaseTask):
                 per_caption = []
                 per_image_map = {}
                 per_image_model_map = {}
+
+                def _to_py_num(x):
+                    import numpy as _np, torch as _torch
+                    if x is None:
+                        return None
+                    if isinstance(x, _torch.Tensor):
+                        try:
+                            return x.item()
+                        except:
+                            x = x.cpu().numpy()
+                    if isinstance(x, _np.generic):
+                        return x.item()
+                    try:
+                        # prefer int when possible
+                        iv = int(x)
+                        if float(iv) == float(x):
+                            return iv
+                    except Exception:
+                        pass
+                    try:
+                        return float(x)
+                    except Exception:
+                        return x
+
                 for idx, record in enumerate(ev.records):
                     ann_id = record.get('ann_id', None)
                     image_id = record.get('img_info', None)
@@ -517,9 +541,19 @@ class ControlCapTask(BaseTask):
                         pred_bbox = ann_map[ann_id]["bbox"]
                         model_score = ann_map[ann_id]["model_score"]
                     else:
-                        # ev.records contains 'score' (sorted detection confidence) — use it when ann_id missing
                         pred_bbox = None
                         model_score = float(record.get('score', 0.0))
+
+                    # Normalize types to Python scalars/lists
+                    ann_id = _to_py_num(ann_id)
+                    image_id = _to_py_num(image_id)
+                    meteor_score = float(meteor_score)
+                    model_score = _to_py_num(model_score)
+                    if pred_bbox is not None:
+                        try:
+                            pred_bbox = [_to_py_num(el) for el in pred_bbox]
+                        except Exception:
+                            pred_bbox = list(pred_bbox)
 
                     per_caption.append({
                         "ann_id": ann_id,
@@ -545,14 +579,14 @@ class ControlCapTask(BaseTask):
                     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
                     per_image = []
                     for img_id, scores in per_image_map.items():
-                        avg_meteor = sum(scores) / len(scores) if len(scores) > 0 else 0.0
+                        avg_meteor = float(sum(scores) / len(scores)) if len(scores) > 0 else 0.0
                         model_scores = per_image_model_map.get(img_id, [])
-                        avg_model = sum(model_scores) / len(model_scores) if len(model_scores) > 0 else 0.0
+                        avg_model = float(sum([_to_py_num(s) if s is not None else 0.0 for s in model_scores]) / len(model_scores)) if len(model_scores) > 0 else 0.0
                         per_image.append({
-                            "image_id": img_id,
+                            "image_id": _to_py_num(img_id),
                             "avg_meteor": avg_meteor,
                             "avg_model_score": avg_model,
-                            "num_preds": len(scores)
+                            "num_preds": int(len(scores))
                         })
                     per_image_sorted = sorted(per_image, key=lambda x: x["avg_meteor"])
                     with open(out_path, "w") as fw:
